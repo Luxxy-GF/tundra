@@ -1,0 +1,8 @@
+target/
+/config*.yml
+*.db
+*.db-journal
+/run
+/docs
+/scripts
+.idea/

@@ -1,0 +1,22 @@
+services:
+  tundra:
+    image: ghcr.io/calagopus/tundra:latest
+    restart: unless-stopped
+    # the node binds loopback frontends inside other containers' network namespaces,
+    # which needs host networking, the host pid namespace and CAP_SYS_ADMIN, privileged
+    # covers all three. it is the same access the systemd deployment runs with (root).
+    privileged: true
+    network_mode: host
+    pid: host
+    environment:
+      TZ: "Europe/Berlin"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      # hosts files of adopted containers are rewritten in place
+      - "/var/lib/docker/containers/:/var/lib/docker/containers/"
+      # the main tundra configuration file, expected next to this compose file
+      - "./config.yml:/etc/calagopus-tundra/config.yml"
+      # node identity, certificate and carried-flow state (config: data_dir)
+      - "/var/lib/calagopus-tundra/:/var/lib/calagopus-tundra/"
+    # host networking is required, so the tunnel (config: tunnel_bind, default 7100/udp)
+    # and metrics (config: metrics_bind, default 127.0.0.1:7101) ports need no mapping
