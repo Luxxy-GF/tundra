@@ -161,6 +161,7 @@ mod tests {
     // in_netns
 
     #[test]
+    #[ignore = "needs root for setns"]
     fn binding_in_our_own_namespace_round_trips_through_the_helper_thread() {
         let target = ContainerTarget {
             pid: std::process::id() as i32,
@@ -175,6 +176,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs root for setns"]
     fn sockets_come_back_non_blocking_as_tokio_requires() {
         let target = ContainerTarget {
             pid: std::process::id() as i32,
