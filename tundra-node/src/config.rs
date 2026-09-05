@@ -12,9 +12,15 @@ const UNIX_AUTHORITY: &str = "localhost";
 const UNIX_ORIGIN: &str = "http://localhost";
 const LOCAL_CONFIG_PATH: &str = "config.yml";
 
+fn unloaded_sha256() -> Hash32 {
+    Hash32([0; 32])
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct NodeConfig {
+    #[serde(skip, default = "unloaded_sha256")]
+    pub loaded_sha256: Hash32,
     pub remote: RemoteConfig,
 
     pub tunnel_bind: SocketAddr,
@@ -31,6 +37,7 @@ pub struct NodeConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
+            loaded_sha256: Hash32([0; 32]),
             remote: RemoteConfig::default(),
             tunnel_bind: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 7100),
             metrics_bind: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 7101),
@@ -115,9 +122,10 @@ impl NodeConfig {
 
         let text =
             std::fs::read_to_string(path).context(format!("failed to read {}", path.display()))?;
-        let config: Self =
+        let mut config: Self =
             serde_norway::from_str(&text).context(format!("failed to parse {}", path.display()))?;
         config.validate()?;
+        config.loaded_sha256 = tundra_common::hash::sha256(text.as_bytes());
 
         Ok(config)
     }
@@ -297,6 +305,21 @@ data_dir: /var/lib/calagopus-tundra
         std::fs::write(&path, body).unwrap();
 
         path
+    }
+
+    #[test]
+    fn loaded_hash_describes_the_parsed_bytes_after_the_file_changes() {
+        let path = written("loaded-hash", SAMPLE);
+        let config = NodeConfig::open(&path).unwrap();
+        std::fs::write(&path, SAMPLE.replace("7100", "7200")).unwrap();
+        assert_eq!(
+            config.loaded_sha256,
+            tundra_common::hash::sha256(SAMPLE.as_bytes())
+        );
+        assert_ne!(
+            config.loaded_sha256,
+            NodeConfig::open(&path).unwrap().loaded_sha256
+        );
     }
 
     // NodeConfig

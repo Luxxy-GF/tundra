@@ -277,6 +277,10 @@ impl Node {
         }
 
         let old = self.index();
+        if self.applied_any.load(Relaxed) && old.snapshot() == &snapshot {
+            self.reconcile_local().await;
+            return;
+        }
         let new = Arc::new(SnapshotIndex::new(snapshot));
 
         *self.index.write() = Arc::clone(&new);
@@ -1260,6 +1264,95 @@ pub async fn maintenance_loop(node: Arc<Node>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshots_coalesce_policy_but_accept_local_changes_and_revoke_existing_relays() {
+        tokio_test::block_on(async {
+            let dir =
+                std::env::temp_dir().join(format!("tundra-snapshot-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+            let cert = rcgen::CertificateParams::new(Vec::<String>::new())
+                .unwrap()
+                .self_signed(&key)
+                .unwrap();
+            std::fs::write(dir.join("node.key.pem"), key.serialize_pem()).unwrap();
+            std::fs::write(dir.join("node.crt.pem"), cert.pem()).unwrap();
+            let uuid = uuid::Uuid::new_v4();
+            let identity = Identity::from_disk(&dir, uuid).unwrap();
+            let config = Arc::new(NodeConfig {
+                data_dir: dir.clone(),
+                remote: crate::config::RemoteConfig {
+                    url: "unix:///unused".into(),
+                    token: "test".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+            let remote =
+                Arc::new(RemoteClient::new(Arc::clone(&config), Arc::clone(&provider)).unwrap());
+            let metrics = Arc::new(Metrics::default());
+            let restart = Arc::new(Handover::new(
+                None,
+                Vec::new(),
+                0,
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+            ));
+            let (refresh_tx, _) = mpsc::channel(1);
+            let node = Node::new(
+                config,
+                identity,
+                remote,
+                Arc::clone(&metrics),
+                provider,
+                None,
+                Arc::new(frontend::binder::NetnsBinder),
+                restart,
+                refresh_tx,
+            );
+            let mut snapshot = Snapshot::empty();
+            snapshot.epoch = 42;
+            for idx in 0..2 {
+                snapshot.servers.push(tundra_common::state::ServerEntry {
+                    uuid: uuid::Uuid::from_u128(u128::from(idx) + 1),
+                    idx,
+                    node_uuid: uuid,
+                    name: format!("s{idx}"),
+                    aliases: Vec::new(),
+                    container_ref: "old".into(),
+                    dial_addr: None,
+                    ports: vec![tundra_common::state::PortSpec {
+                        port: 8080,
+                        proto: tundra_common::state::Proto::Tcp,
+                    }],
+                });
+            }
+            let src = uuid::Uuid::from_u128(1);
+            let dst = uuid::Uuid::from_u128(2);
+            snapshot.acls.push(tundra_common::state::AclEntry {
+                src_server: src,
+                dst_server: dst,
+            });
+            node.apply_snapshot(snapshot.clone()).await;
+            node.apply_snapshot(snapshot.clone()).await;
+            assert_eq!(metrics.snapshots_applied.load(Relaxed), 1);
+            snapshot.servers.first_mut().unwrap().container_ref = "new".into();
+            node.apply_snapshot(snapshot.clone()).await;
+            assert_eq!(metrics.snapshots_applied.load(Relaxed), 2);
+            assert_eq!(node.index().server(&src).unwrap().container_ref, "new");
+            let (_guard, cancel) = node.relays.register(src, dst, 8080, Transport::Tcp);
+            assert!(!*cancel.borrow());
+            let mut revoked = Snapshot::empty();
+            revoked.epoch = snapshot.epoch;
+            node.apply_snapshot(revoked).await;
+            assert!(*cancel.borrow());
+            assert!(!node.index().allows(&src, &dst));
+            drop(node);
+            std::fs::remove_dir_all(dir).unwrap();
+        });
+    }
 
     // REAUTH_RECOVERY_GRACE
 

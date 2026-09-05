@@ -175,8 +175,40 @@ impl PeerMetrics {
     }
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct Applied {
+    pub binary_sha256: tundra_common::hash::Hash32,
+    pub config_sha256: tundra_common::hash::Hash32,
+}
+
+impl Applied {
+    pub fn load(config_sha256: tundra_common::hash::Hash32) -> Result<Self, anyhow::Error> {
+        use sha2::Digest;
+        use std::io::Read;
+
+        let mut executable = std::fs::File::open("/proc/self/exe")?;
+        let mut hasher = sha2::Sha256::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let read = executable.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            if let Some(bytes) = buffer.get(..read) {
+                hasher.update(bytes);
+            }
+        }
+
+        Ok(Self {
+            binary_sha256: tundra_common::hash::Hash32(hasher.finalize().into()),
+            config_sha256,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct Metrics {
+    pub applied: Option<Applied>,
     pub uuid: parking_lot::Mutex<Option<uuid::Uuid>>,
     pub epoch: AtomicU64,
     pub remote_link: AtomicBool,
@@ -197,6 +229,7 @@ pub struct Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self {
+            applied: None,
             uuid: parking_lot::Mutex::new(None),
             epoch: AtomicU64::new(0),
             remote_link: AtomicBool::new(false),
@@ -217,6 +250,13 @@ impl Default for Metrics {
 }
 
 impl Metrics {
+    pub fn new_with_applied(applied: Applied) -> Self {
+        Self {
+            applied: Some(applied),
+            ..Default::default()
+        }
+    }
+
     pub fn attach_restart(&self, handover: Arc<crate::node::restart::Handover>) {
         *self.restart.lock() = Some(handover);
     }
@@ -240,6 +280,7 @@ impl Metrics {
         list.sort_by_key(|p| p.uuid);
 
         json!({
+            "applied": self.applied,
             "node": {
                 "uuid": *self.uuid.lock(),
                 "uptime_secs": self.started.elapsed().as_secs(),
@@ -542,6 +583,23 @@ pub async fn serve(bind: SocketAddr, metrics: Arc<Metrics>) -> Result<(), anyhow
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn applied_metrics_identify_the_running_executable_and_loaded_config() {
+        let config_sha256 = tundra_common::hash::sha256(b"loaded config");
+        let applied = Applied::load(config_sha256).unwrap();
+        let binary_sha256 = tundra_common::hash::sha256(&std::fs::read("/proc/self/exe").unwrap());
+        assert_eq!(applied.binary_sha256, binary_sha256);
+        let metrics = Metrics::new_with_applied(applied).snapshot_json();
+        assert_eq!(
+            metrics["applied"]["config_sha256"],
+            serde_json::json!(config_sha256)
+        );
+        assert_eq!(
+            metrics["applied"]["binary_sha256"],
+            serde_json::json!(binary_sha256)
+        );
+    }
 
     // Metrics
 

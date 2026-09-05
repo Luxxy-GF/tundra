@@ -101,7 +101,8 @@ async fn main() -> Result<(), anyhow::Error> {
         "node identity established"
     );
 
-    let metrics = Arc::new(Metrics::default());
+    let applied = metrics::Applied::load(config.loaded_sha256)?;
+    let metrics = Arc::new(Metrics::new_with_applied(applied));
 
     let docker = match DockerAdapter::new() {
         Ok(d) => Some(d),
