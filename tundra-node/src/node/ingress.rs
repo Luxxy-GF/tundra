@@ -96,7 +96,16 @@ pub async fn control_loop(node: Arc<Node>, conn: Arc<PeerConn>, mut recv: quinn:
                     return;
                 }
             }
-            ControlMsg::ReAuthAck => conn.touch_auth(),
+            ControlMsg::ReAuthAck => {
+                if !conn.ack_reauth() {
+                    tracing::warn!(
+                        peer = %conn.peer,
+                        "unsolicited re-auth ack, closing"
+                    );
+                    conn.close(CloseCode::Protocol);
+                    return;
+                }
+            }
             ControlMsg::FlowOpen(open) => flow_open(&node, &conn, open).await,
             ControlMsg::FlowUnknown { flow_id } => flow_unknown(&conn, flow_id),
             ControlMsg::DrainStart { flows, last } => {
@@ -267,6 +276,13 @@ async fn flow_open(node: &Arc<Node>, conn: &Arc<PeerConn>, open: FlowOpen) {
         }
     }
 
+    let (_relay_guard, cancel) = node.relays.register(
+        open.src_server,
+        open.dst_server,
+        open.dst_port,
+        Transport::Udp,
+    );
+
     let Some(target) = dial_target(node, &open.dst_server, open.dst_port) else {
         tracing::debug!(
             dst = %open.dst_server,
@@ -287,6 +303,23 @@ async fn flow_open(node: &Arc<Node>, conn: &Arc<PeerConn>, open: FlowOpen) {
         }
     };
 
+    if let Err(code) = admit(
+        &node.index(),
+        &conn.peer,
+        &node.uuid,
+        &open.src_server,
+        &open.dst_server,
+        open.dst_port,
+        Transport::Udp,
+    ) {
+        tracing::debug!(
+            peer = %conn.peer,
+            reason = %code.to_str(),
+            "access withdrawn while dialling"
+        );
+        return;
+    }
+
     let reader = tokio::spawn(ingress_reader(
         Arc::clone(conn),
         open.flow_id,
@@ -296,6 +329,17 @@ async fn flow_open(node: &Arc<Node>, conn: &Arc<PeerConn>, open: FlowOpen) {
     let writer = tokio::spawn(container_writer(Arc::clone(&socket), rx));
 
     let mut udp = conn.udp.lock();
+
+    if *cancel.borrow() {
+        tracing::debug!(
+            peer = %conn.peer,
+            flow = open.flow_id,
+            "access withdrawn while dialling"
+        );
+        reader.abort();
+        writer.abort();
+        return;
+    }
     let flow = IngressFlow {
         to_container,
         socket,

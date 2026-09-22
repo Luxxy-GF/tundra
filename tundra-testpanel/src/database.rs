@@ -207,8 +207,15 @@ impl Database {
         Ok(changed > 0)
     }
 
+    #[inline]
     pub fn node_by_token(&self, token: &str) -> Result<Option<uuid::Uuid>, anyhow::Error> {
-        let digest = tundra_common::hash::sha256(token.as_bytes());
+        self.node_by_token_digest(tundra_common::hash::sha256(token.as_bytes()))
+    }
+
+    pub fn node_by_token_digest(
+        &self,
+        digest: Hash32,
+    ) -> Result<Option<uuid::Uuid>, anyhow::Error> {
         self.locked(|c| {
             Ok(c.query_row(
                 "SELECT uuid FROM nodes WHERE token_sha256 = ?1",

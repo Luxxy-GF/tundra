@@ -24,7 +24,7 @@ struct Conn {
 #[derive(Default)]
 pub struct Hub {
     conns: parking_lot::Mutex<HashMap<uuid::Uuid, Conn>>,
-    pending: parking_lot::Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>,
+    pending: parking_lot::Mutex<HashMap<(uuid::Uuid, u64), oneshot::Sender<serde_json::Value>>>,
     counter: AtomicU64,
 }
 
@@ -103,11 +103,11 @@ impl Hub {
                 .ok_or_else(|| anyhow::anyhow!("node {node} is not connected"))?
         };
 
-        self.pending.lock().insert(req_id, tx);
+        self.pending.lock().insert((*node, req_id), tx);
 
         let sent = sender.try_send(RemoteMsg::MetricsRequest { req_id });
         if let Err(err) = sent {
-            self.pending.lock().remove(&req_id);
+            self.pending.lock().remove(&(*node, req_id));
 
             return Err(anyhow::anyhow!("node {node} outbox is full: {err}"));
         }
@@ -115,16 +115,16 @@ impl Hub {
         match tokio::time::timeout(METRICS_TIMEOUT, rx).await {
             Ok(Ok(value)) => Ok(value),
             other => {
-                self.pending.lock().remove(&req_id);
+                self.pending.lock().remove(&(*node, req_id));
 
                 Err(anyhow::anyhow!("no metrics reply from {node}: {other:?}"))
             }
         }
     }
 
-    pub fn deliver(&self, msg: NodeMsg) {
+    pub fn deliver(&self, node: &uuid::Uuid, msg: NodeMsg) {
         let NodeMsg::Metrics { req_id, body } = msg;
-        if let Some(tx) = self.pending.lock().remove(&req_id) {
+        if let Some(tx) = self.pending.lock().remove(&(*node, req_id)) {
             let _ = tx.send(body);
         }
     }
@@ -251,20 +251,68 @@ mod tests {
             }
             .unwrap();
 
-            hub.deliver(NodeMsg::Metrics {
-                req_id,
-                body: serde_json::json!({ "ok": true }),
-            });
+            hub.deliver(
+                &node,
+                NodeMsg::Metrics {
+                    req_id,
+                    body: serde_json::json!({ "ok": true }),
+                },
+            );
 
             assert_eq!(
                 task.await.unwrap().unwrap(),
                 serde_json::json!({ "ok": true })
             );
 
-            hub.deliver(NodeMsg::Metrics {
-                req_id: 999,
-                body: serde_json::Value::Null,
+            hub.deliver(
+                &node,
+                NodeMsg::Metrics {
+                    req_id: 999,
+                    body: serde_json::Value::Null,
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn a_reply_from_another_node_cannot_answer_a_metrics_request() {
+        tokio_test::block_on(async {
+            let hub = Arc::new(Hub::new());
+            let node = uuid::Uuid::from_u128(1);
+            let other = uuid::Uuid::from_u128(2);
+            let mut reg = hub.register(node);
+
+            let task = tokio::spawn({
+                let hub = Arc::clone(&hub);
+
+                async move { hub.request_metrics(&node).await }
             });
+
+            let req_id = match reg.commands.recv().await.unwrap() {
+                RemoteMsg::MetricsRequest { req_id } => Some(req_id),
+                RemoteMsg::Snapshot { .. } => None,
+            }
+            .unwrap();
+
+            hub.deliver(
+                &other,
+                NodeMsg::Metrics {
+                    req_id,
+                    body: serde_json::json!({ "forged": true }),
+                },
+            );
+            hub.deliver(
+                &node,
+                NodeMsg::Metrics {
+                    req_id,
+                    body: serde_json::json!({ "ok": true }),
+                },
+            );
+
+            assert_eq!(
+                task.await.unwrap().unwrap(),
+                serde_json::json!({ "ok": true })
+            );
         });
     }
 

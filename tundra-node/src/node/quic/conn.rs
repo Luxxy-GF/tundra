@@ -54,6 +54,46 @@ pub fn parity_for(role: Role) -> Parity {
     }
 }
 
+struct AuthState {
+    last: parking_lot::Mutex<Instant>,
+    ack_pending: AtomicBool,
+}
+
+impl AuthState {
+    fn new() -> Self {
+        Self {
+            last: parking_lot::Mutex::new(Instant::now()),
+            ack_pending: AtomicBool::new(false),
+        }
+    }
+
+    #[inline]
+    fn touch(&self) {
+        *self.last.lock() = Instant::now();
+    }
+
+    #[inline]
+    fn last(&self) -> Instant {
+        *self.last.lock()
+    }
+
+    #[inline]
+    fn expect_ack(&self) {
+        self.ack_pending.store(true, Relaxed);
+    }
+
+    /// Only an ack answering a `ReAuth` this side sent counts; anything else is a peer
+    /// refreshing a deadline it never re-authenticated for.
+    fn ack(&self) -> bool {
+        if !self.ack_pending.swap(false, Relaxed) {
+            return false;
+        }
+
+        self.touch();
+        true
+    }
+}
+
 pub struct PeerConn {
     pub peer: uuid::Uuid,
     pub role: Role,
@@ -68,7 +108,7 @@ pub struct PeerConn {
     pub claimed: parking_lot::Mutex<Vec<u64>>,
 
     control: mpsc::Sender<ControlMsg>,
-    last_auth: parking_lot::Mutex<Instant>,
+    auth: AuthState,
 
     drain_tx: mpsc::Sender<DrainMsg>,
     drain_rx: tokio::sync::Mutex<mpsc::Receiver<DrainMsg>>,
@@ -109,7 +149,7 @@ impl PeerConn {
             stream_slots: Arc::new(Semaphore::new(stream_slots)),
             claimed: parking_lot::Mutex::new(Vec::new()),
             control,
-            last_auth: parking_lot::Mutex::new(Instant::now()),
+            auth: AuthState::new(),
             drain_tx,
             drain_rx: tokio::sync::Mutex::new(drain_rx),
             draining: AtomicBool::new(false),
@@ -165,12 +205,22 @@ impl PeerConn {
 
     #[inline]
     pub fn touch_auth(&self) {
-        *self.last_auth.lock() = Instant::now();
+        self.auth.touch();
     }
 
     #[inline]
     pub fn last_auth(&self) -> Instant {
-        *self.last_auth.lock()
+        self.auth.last()
+    }
+
+    #[inline]
+    pub fn expect_reauth_ack(&self) {
+        self.auth.expect_ack();
+    }
+
+    #[inline]
+    pub fn ack_reauth(&self) -> bool {
+        self.auth.ack()
     }
 
     #[inline]
@@ -320,6 +370,29 @@ mod tests {
         let bytes = encode_frame(&resume).unwrap();
         assert_eq!(decode_frame::<StreamHeader>(&bytes[4..]).unwrap(), resume);
         assert_ne!(resume, header);
+    }
+
+    // AuthState
+
+    #[test]
+    fn an_unsolicited_reauth_ack_leaves_the_auth_time_alone() {
+        let auth = AuthState::new();
+        let initial = auth.last();
+
+        assert!(!auth.ack());
+        assert_eq!(auth.last(), initial);
+    }
+
+    #[test]
+    fn a_reauth_ack_refreshes_the_auth_time_once_per_reauth_sent() {
+        let auth = AuthState::new();
+
+        auth.expect_ack();
+        let before = Instant::now();
+        assert!(auth.ack());
+        assert!(auth.last() >= before);
+
+        assert!(!auth.ack());
     }
 
     // PeerConn

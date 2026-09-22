@@ -927,6 +927,7 @@ async fn reauth_loop(node: Arc<Node>, conn: Arc<PeerConn>) {
         loop {
             match node.fresh_token(&conn.peer).await {
                 Ok(jwt) => {
+                    conn.expect_reauth_ack();
                     if !conn.send_control(ControlMsg::ReAuth { jwt }).await {
                         return;
                     }

@@ -1,14 +1,16 @@
 use super::{GetNodeAuth, NodeAuth, State};
-use crate::routes::GetState;
+use crate::routes::{ApiError, GetState, bearer};
 use axum::{
     Router,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    http::HeaderMap,
     response::Response,
     routing::any,
 };
 use futures::{SinkExt, StreamExt};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tundra_common::{
+    hash::Hash32,
     state::Snapshot,
     sync::{NodeMsg, RemoteMsg},
 };
@@ -16,16 +18,31 @@ use tundra_common::{
 pub async fn handle_ws(
     axum::extract::State(state): GetState,
     axum::extract::Extension(NodeAuth(node)): GetNodeAuth,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
-) -> Response {
+) -> Result<Response, ApiError> {
+    let token = bearer(&headers).ok_or(ApiError::Unauthorized)?;
+    let digest = tundra_common::hash::sha256(token.as_bytes());
+
     // the 64 MiB default would let a buggy node pin that much before the parse even fails
-    ws.max_message_size(1024 * 1024)
-        .on_upgrade(move |socket| node_ws_task(socket, state, node))
+    Ok(ws
+        .max_message_size(1024 * 1024)
+        .on_upgrade(move |socket| node_ws_task(socket, state, node, digest)))
 }
 
-async fn node_ws_task(socket: WebSocket, state: State, node: uuid::Uuid) {
+async fn node_ws_task(socket: WebSocket, state: State, node: uuid::Uuid, token: Hash32) {
     let mut registration = state.hub.register(node);
     let conn_id = registration.id;
+
+    if state.database.node_by_token_digest(token).ok().flatten() != Some(node) {
+        state.hub.unregister(&node, conn_id);
+        tracing::info!(
+            node = %node,
+            conn_id,
+            "node websocket refused, token revoked during the upgrade"
+        );
+        return;
+    }
     if let Err(err) = state.database.touch_node(&node, now_secs()) {
         tracing::debug!(
             node = %node,
@@ -33,6 +50,7 @@ async fn node_ws_task(socket: WebSocket, state: State, node: uuid::Uuid) {
             err
         );
     }
+
     tracing::info!(
         node = %node,
         conn_id,
@@ -78,7 +96,7 @@ async fn node_ws_task(socket: WebSocket, state: State, node: uuid::Uuid) {
             },
             incoming = stream.next() => match incoming {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<NodeMsg>(&text) {
-                    Ok(msg) => state.hub.deliver(msg),
+                    Ok(msg) => state.hub.deliver(&node, msg),
                     Err(err) => tracing::warn!(
                         node = %node,
                         "failed to parse a node message: {:?}",

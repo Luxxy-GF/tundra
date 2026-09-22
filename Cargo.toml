@@ -4,7 +4,7 @@ members = ["tundra-common", "tundra-node", "tundra-testpanel"]
 default-members = ["tundra-node"]
 package.rust-version = "1.97.0"
 package.license = "MIT"
-package.version = "1.0.0"
+package.version = "1.0.1"
 package.edition = "2024"
 
 [workspace.dependencies]

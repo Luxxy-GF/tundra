@@ -9,8 +9,16 @@ use std::{fs, path::Path};
 use tundra_common::hash::{Hash32, sha256};
 
 fn load_or_create_key(dir: &Path) -> Result<KeyPair, anyhow::Error> {
+    use std::io::Write;
+
     let path = dir.join("node.key.pem");
     if path.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        }
+
         return KeyPair::from_pkcs8_pem_and_sign_algo(
             &fs::read_to_string(&path)?,
             &PKCS_ECDSA_P256_SHA256,
@@ -19,13 +27,17 @@ fn load_or_create_key(dir: &Path) -> Result<KeyPair, anyhow::Error> {
     }
 
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
-    fs::write(&path, key.serialize_pem())?;
-
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    options
+        .open(&path)
+        .context(format!("failed to create {}", path.display()))?
+        .write_all(key.serialize_pem().as_bytes())?;
 
     tracing::info!("generated a new node keypair");
 
@@ -200,6 +212,31 @@ mod tests {
         let a = load_or_create_key(&dir).unwrap();
         let b = load_or_create_key(&dir).unwrap();
         assert_eq!(a.serialize_der(), b.serialize_der());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_or_create_key_keeps_the_key_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tundra-id-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.key.pem");
+
+        load_or_create_key(&dir).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        load_or_create_key(&dir).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
