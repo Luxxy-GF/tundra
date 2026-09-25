@@ -217,6 +217,7 @@ pub struct Metrics {
     pub local_streams_total: AtomicU64,
     pub local_flows_open: AtomicU64,
     pub local_drops: AtomicU64,
+    pub handshakes_refused: AtomicU64,
 
     pub snapshots_applied: AtomicU64,
     pub frozen_flows: AtomicU64,
@@ -238,6 +239,7 @@ impl Default for Metrics {
             local_streams_total: AtomicU64::new(0),
             local_flows_open: AtomicU64::new(0),
             local_drops: AtomicU64::new(0),
+            handshakes_refused: AtomicU64::new(0),
 
             snapshots_applied: AtomicU64::new(0),
             frozen_flows: AtomicU64::new(0),
@@ -291,6 +293,7 @@ impl Metrics {
                 "local_streams_total": self.local_streams_total.load(Relaxed),
                 "local_flows_open": self.local_flows_open.load(Relaxed),
                 "local_drops": self.local_drops.load(Relaxed),
+                "handshakes_refused": self.handshakes_refused.load(Relaxed),
                 "frozen_flows": self.frozen_flows.load(Relaxed),
                 "peers_connected": list.len(),
             },
@@ -354,6 +357,17 @@ impl Metrics {
                 o.push_str(&format!(
                     "tundra_local_drops_total {}\n",
                     self.local_drops.load(Relaxed)
+                ))
+            },
+        );
+        gauge(
+            "tundra_handshakes_refused_total",
+            "inbound handshakes refused over the handshake budget",
+            "counter",
+            &|o| {
+                o.push_str(&format!(
+                    "tundra_handshakes_refused_total {}\n",
+                    self.handshakes_refused.load(Relaxed)
                 ))
             },
         );

@@ -546,6 +546,14 @@ async fn collect(
                         totals.insert(total.flow_id, u64::MAX);
                     }
                 }
+                if totals.len() > MAX_CARRIED_FLOWS {
+                    tracing::warn!(
+                        flows = totals.len(),
+                        cap = MAX_CARRIED_FLOWS,
+                        "the peer announced more flows than a carry can hold"
+                    );
+                    return Collected::Nothing;
+                }
                 if last {
                     return Collected::Totals(totals);
                 }
@@ -761,6 +769,107 @@ mod tests {
             )
             .await;
             assert_eq!(got, Collected::PeerRestarting);
+        });
+    }
+
+    fn ready_chunks(ids: std::ops::Range<u64>, last: bool) -> Vec<DrainMsg> {
+        let ids: Vec<u64> = ids.collect();
+        let n = ids.chunks(256).len();
+        ids.chunks(256)
+            .enumerate()
+            .map(|(i, chunk)| DrainMsg::Ready {
+                flows: chunk
+                    .iter()
+                    .map(|&flow_id| FlowTotal {
+                        flow_id,
+                        written: flow_id,
+                    })
+                    .collect(),
+                last: last && i + 1 == n,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn collect_accepts_exactly_the_carried_flow_cap_across_chunks() {
+        tokio_test::block_on(async {
+            let cap = MAX_CARRIED_FLOWS as u64;
+            let msgs = ready_chunks(0..cap, true);
+            let (tx, mut rx) = mpsc::channel(msgs.len());
+            for msg in msgs {
+                tx.send(msg).await.unwrap();
+            }
+
+            let got = collect(
+                &mut rx,
+                Instant::now() + Duration::from_secs(5),
+                Want::Ready,
+            )
+            .await;
+            assert_eq!(
+                got,
+                Collected::Totals((0..cap).map(|id| (id, id)).collect())
+            );
+        });
+    }
+
+    #[test]
+    fn collect_does_not_count_repeated_flow_ids_toward_the_cap() {
+        tokio_test::block_on(async {
+            let cap = MAX_CARRIED_FLOWS as u64;
+            let mut msgs = ready_chunks(0..cap, false);
+            msgs.push(DrainMsg::Ready {
+                flows: vec![
+                    FlowTotal {
+                        flow_id: 0,
+                        written: 1,
+                    },
+                    FlowTotal {
+                        flow_id: cap - 1,
+                        written: 1,
+                    },
+                ],
+                last: true,
+            });
+            let (tx, mut rx) = mpsc::channel(msgs.len());
+            for msg in msgs {
+                tx.send(msg).await.unwrap();
+            }
+
+            let got = collect(
+                &mut rx,
+                Instant::now() + Duration::from_secs(5),
+                Want::Ready,
+            )
+            .await;
+            let mut want: HashMap<u64, u64> = (0..cap).map(|id| (id, id)).collect();
+            want.insert(0, u64::MAX);
+            want.insert(cap - 1, u64::MAX);
+            assert_eq!(got, Collected::Totals(want));
+        });
+    }
+
+    #[test]
+    fn collect_gives_up_on_a_peer_announcing_more_than_the_cap_without_waiting() {
+        tokio_test::block_on(async {
+            let msgs = ready_chunks(0..MAX_CARRIED_FLOWS as u64 + 1, false);
+            let (tx, mut rx) = mpsc::channel(msgs.len());
+            for msg in msgs {
+                tx.send(msg).await.unwrap();
+            }
+
+            let got = tokio::time::timeout(
+                Duration::from_secs(5),
+                collect(
+                    &mut rx,
+                    Instant::now() + Duration::from_secs(60),
+                    Want::Ready,
+                ),
+            )
+            .await
+            .expect("collect waited on the deadline instead of enforcing the cap");
+            assert_eq!(got, Collected::Nothing);
+            drop(tx);
         });
     }
 

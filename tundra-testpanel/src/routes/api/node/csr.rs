@@ -5,8 +5,9 @@ mod post {
     use crate::routes::{
         ApiError, GetState,
         api::node::{GetNodeAuth, NodeAuth},
+        bearer,
     };
-    use axum::Json;
+    use axum::{Json, http::HeaderMap};
     use serde::Deserialize;
     use serde_json::json;
 
@@ -18,14 +19,24 @@ mod post {
     pub async fn route(
         state: GetState,
         axum::extract::Extension(NodeAuth(node)): GetNodeAuth,
+        headers: HeaderMap,
         Json(data): Json<Payload>,
     ) -> Result<Json<serde_json::Value>, ApiError> {
+        let token = bearer(&headers).ok_or(ApiError::Unauthorized)?;
+        let digest = tundra_common::hash::sha256(token.as_bytes());
+
         let signed = state
             .keys
             .sign_node_csr(&data.csr_pem, &node)
             .map_err(|err| ApiError::BadRequest(err.to_string()))?;
 
-        state.database.store_node_cert(&node, signed.sha256)?;
+        if !state
+            .database
+            .store_node_cert(&node, digest, signed.sha256)?
+        {
+            return Err(ApiError::Unauthorized);
+        }
+
         state.publish()?;
         tracing::info!(
             node = %node,

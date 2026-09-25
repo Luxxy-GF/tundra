@@ -230,17 +230,21 @@ impl Database {
     pub fn store_node_cert(
         &self,
         uuid: &uuid::Uuid,
+        token_sha256: Hash32,
         cert_sha256: Hash32,
-    ) -> Result<(), anyhow::Error> {
-        self.locked(|c| {
-            c.execute(
-                "UPDATE nodes SET cert_sha256 = ?2 WHERE uuid = ?1",
-                params![uuid.to_string(), cert_sha256.0],
+    ) -> Result<bool, anyhow::Error> {
+        let changed = self.locked(|c| {
+            let n = c.execute(
+                "UPDATE nodes SET cert_sha256 = ?3 WHERE uuid = ?1 AND token_sha256 = ?2",
+                params![uuid.to_string(), token_sha256.0, cert_sha256.0],
             )?;
-            Ok(bump_epoch(c)?)
+            if n > 0 {
+                bump_epoch(c)?;
+            }
+            Ok::<_, anyhow::Error>(n)
         })?;
 
-        Ok(())
+        Ok(changed > 0)
     }
 
     pub fn touch_node(&self, uuid: &uuid::Uuid, at: i64) -> Result<(), anyhow::Error> {
@@ -544,7 +548,11 @@ mod tests {
     fn rotation_invalidates_the_old_token_and_clears_the_certificate() {
         let db = db();
         let (uuid, old) = db.create_node("a", "10.0.0.1", 7100).unwrap();
-        db.store_node_cert(&uuid, Hash32([3; 32])).unwrap();
+        let old_digest = tundra_common::hash::sha256(old.as_bytes());
+        assert!(
+            db.store_node_cert(&uuid, old_digest, Hash32([3; 32]))
+                .unwrap()
+        );
         assert_eq!(
             db.list_nodes().unwrap()[0].cert_sha256,
             Some(Hash32([3; 32]))
@@ -560,6 +568,32 @@ mod tests {
     #[test]
     fn rotating_an_unknown_node_is_an_error() {
         assert!(db().rotate_node(&uuid::Uuid::new_v4()).is_err());
+    }
+
+    // Database::store_node_cert
+
+    #[test]
+    fn a_rotated_away_token_cannot_pin_a_certificate_but_the_new_one_can() {
+        let db = db();
+        let (uuid, old) = db.create_node("a", "10.0.0.1", 7100).unwrap();
+        let new = db.rotate_node(&uuid).unwrap();
+
+        let old_digest = tundra_common::hash::sha256(old.as_bytes());
+        assert!(
+            !db.store_node_cert(&uuid, old_digest, Hash32([3; 32]))
+                .unwrap()
+        );
+        assert_eq!(db.list_nodes().unwrap()[0].cert_sha256, None);
+
+        let new_digest = tundra_common::hash::sha256(new.as_bytes());
+        assert!(
+            db.store_node_cert(&uuid, new_digest, Hash32([4; 32]))
+                .unwrap()
+        );
+        assert_eq!(
+            db.list_nodes().unwrap()[0].cert_sha256,
+            Some(Hash32([4; 32]))
+        );
     }
 
     // Database::create_server

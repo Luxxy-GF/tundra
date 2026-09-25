@@ -1,7 +1,7 @@
 use crate::node::{
     FrontendHandle, Node,
     frontend::binder::Kind,
-    ingress::dial_target,
+    ingress::{DIAL_TIMEOUT, dial_target},
     plan::{FrontendKey, desired_frontends},
     quic::conn::write_frame,
     relay::{
@@ -52,19 +52,24 @@ pub fn next_frontend_id() -> u64 {
 pub async fn reconcile(node: &Arc<Node>, index: &SnapshotIndex) {
     let desired = desired_frontends(index, &node.uuid);
 
-    let stale = {
-        let current = node.frontends.lock();
-        let mut stale = Vec::new();
-        for key in current.keys() {
-            if desired.contains(key) {
-                continue;
-            }
+    let current: Vec<(FrontendKey, i32)> = node
+        .frontends
+        .lock()
+        .iter()
+        .map(|(key, handle)| (*key, handle.pid))
+        .collect();
 
-            stale.push(*key);
+    let mut stale = Vec::new();
+    for (key, pid) in current {
+        let moved = node
+            .container_of(&key.src_server)
+            .is_some_and(|c| c.pid != pid);
+        if desired.contains(&key) && !moved {
+            continue;
         }
 
-        stale
-    };
+        stale.push(key);
+    }
 
     for key in stale {
         unbind(node, &key);
@@ -335,23 +340,57 @@ async fn egress_tcp(node: Arc<Node>, key: FrontendKey, tcp: TcpStream, from: Soc
         let Some(target) = dial_target(&node, &key.dst_server, key.port) else {
             return;
         };
-        let Ok(backend) = TcpStream::connect(target).await else {
-            tracing::debug!(
-                target = %target,
-                "failed to dial the local backend"
+
+        let Ok(_permit) = Arc::clone(&node.local_slots).try_acquire_owned() else {
+            tracing::warn!(
+                src = %key.src_server,
+                dst = %key.dst_server,
+                "local stream budget exhausted, refusing a connection"
             );
             return;
         };
-
-        let _ = backend.set_nodelay(true);
-
         let (_guard, cancel) =
             node.relays
                 .register(key.src_server, key.dst_server, key.port, Transport::Tcp);
-        node.metrics.local_streams_total.fetch_add(1, Relaxed);
-        if !node.index().allows(&key.src_server, &key.dst_server) {
+
+        let backend = match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(target)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(err)) => {
+                tracing::debug!(
+                    target = %target,
+                    "failed to dial the local backend: {:?}",
+                    err
+                );
+                return;
+            }
+            Err(_) => {
+                tracing::debug!(
+                    target = %target,
+                    "local backend dial timed out"
+                );
+                return;
+            }
+        };
+        let _ = backend.set_nodelay(true);
+
+        if let Err(code) = admit(
+            &node.index(),
+            &node.uuid,
+            &node.uuid,
+            &key.src_server,
+            &key.dst_server,
+            key.port,
+            Transport::Tcp,
+        ) {
+            tracing::debug!(
+                src = %key.src_server,
+                dst = %key.dst_server,
+                reason = %code.to_str(),
+                "access withdrawn while dialling"
+            );
             return;
         }
+        node.metrics.local_streams_total.fetch_add(1, Relaxed);
 
         let outcome = relay_local(tcp, backend, cancel).await;
         if !matches!(outcome, Outcome::Closed) {
@@ -424,10 +463,19 @@ async fn egress_tcp(node: Arc<Node>, key: FrontendKey, tcp: TcpStream, from: Soc
     if write_frame(&mut send, &header).await.is_err() {
         return;
     }
-    if !node.index().allows(&key.src_server, &key.dst_server) {
+    if let Err(code) = admit(
+        &node.index(),
+        &node.uuid,
+        &dst.node_uuid,
+        &key.src_server,
+        &key.dst_server,
+        key.port,
+        Transport::Tcp,
+    ) {
         tracing::debug!(
             src = %key.src_server,
             dst = %key.dst_server,
+            reason = %code.to_str(),
             "access withdrawn while opening the stream"
         );
         return;
@@ -620,14 +668,21 @@ async fn local_udp(
     payload: &[u8],
     local: &mut HashMap<SocketAddr, LocalFlow>,
 ) {
+    let target = dial_target(node, &key.dst_server, key.port);
+
     if let Some(flow) = local.get_mut(&from) {
-        if flow.to_backend.try_send(payload.to_vec()).is_ok() {
-            flow.last = Instant::now();
-        } else {
-            node.metrics.local_drops.fetch_add(1, Relaxed);
+        if target == Some(flow.target) {
+            if flow.to_backend.try_send(payload.to_vec()).is_ok() {
+                flow.last = Instant::now();
+            } else {
+                node.metrics.local_drops.fetch_add(1, Relaxed);
+            }
+
+            return;
         }
 
-        return;
+        local.remove(&from);
+        node.metrics.local_flows_open.fetch_sub(1, Relaxed);
     }
 
     if local.len() >= MAX_LOCAL_FLOWS {
@@ -635,7 +690,7 @@ async fn local_udp(
         return;
     }
 
-    let Some(target) = dial_target(node, &key.dst_server, key.port) else {
+    let Some(target) = target else {
         return;
     };
 

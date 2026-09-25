@@ -220,6 +220,9 @@ pub async fn relay_stream(
                 return Ok(HalfOutcome::Eof);
             }
 
+            let stopped = send.stopped();
+            tokio::pin!(stopped);
+
             let mut buf = vec![0; RELAY_BUF];
             loop {
                 let n = tokio::select! {
@@ -227,6 +230,11 @@ pub async fn relay_stream(
                     _ = crate::node::relay::cancelled(&mut freeze_tx) => {
                         return Ok(HalfOutcome::Frozen(Vec::new()));
                     }
+                    r = &mut stopped => return match r {
+                        Ok(Some(code)) => Err(HalfError::Reset(code.into_inner())),
+                        Ok(None) => Err("stream finished while still sending".into()),
+                        Err(err) => Err(compact_str::format_compact!("stream stopped: {err}").into()),
+                    },
                     r = reader.read(&mut buf) => r.map_err(|err| compact_str::format_compact!("frontend read: {err}"))?,
                 };
 

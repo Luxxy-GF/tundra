@@ -133,13 +133,26 @@ fn pem_to_der(pem: &str) -> Result<Vec<u8>, anyhow::Error> {
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), anyhow::Error> {
-    fs::write(path, bytes)?;
+    use std::io::Write;
 
+    // a key can outlive its certificate, and create_new below must not trip over it
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    options
+        .open(path)
+        .context(format!("failed to create {}", path.display()))?
+        .write_all(bytes)?;
 
     Ok(())
 }

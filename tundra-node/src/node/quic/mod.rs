@@ -13,6 +13,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tundra_common::wire::ALPN_TUNNEL;
 
 pub mod conn;
+pub mod handshake;
 pub mod registry;
 
 pub const KEEPALIVE: Duration = Duration::from_secs(15);

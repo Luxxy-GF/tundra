@@ -522,8 +522,8 @@ async fn run_resumed(
     node: Arc<Node>,
     conn: Arc<PeerConn>,
     flow: FrozenFlow,
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
     peer_half: tundra_common::wire::HalfClose,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) {
@@ -558,6 +558,33 @@ async fn run_resumed(
         flow.dst_port,
         Transport::Tcp,
     );
+
+    let (src_owner, dst_owner) = match flow.side {
+        Side::Ingress => (conn.peer, node.uuid),
+        Side::Frontend => (node.uuid, conn.peer),
+    };
+    if let Err(code) = admit(
+        &node.index(),
+        &src_owner,
+        &dst_owner,
+        &flow.src_server,
+        &flow.dst_server,
+        flow.dst_port,
+        Transport::Tcp,
+    ) {
+        tracing::debug!(
+            peer = %conn.peer,
+            flow = flow.id,
+            reason = %code.to_str(),
+            "access withdrawn while resuming"
+        );
+        let v = VarInt::from_u32(code.as_u32());
+        let _ = send.reset(v);
+        let _ = recv.stop(v);
+        flow.kill();
+        node.restart.counters.killed(Killed::Unmatched, 1);
+        return;
+    }
 
     conn.metrics.streams_open.fetch_add(1, Relaxed);
     conn.metrics.streams_total.fetch_add(1, Relaxed);
@@ -598,7 +625,22 @@ fn restore_udp(node: &Arc<Node>, conn: &Arc<PeerConn>, udp: CarriedUdp) {
     let now = std::time::Instant::now();
     let mut restored = 0;
 
+    let index = node.index();
     for (rec, socket) in udp.ingress {
+        if admit(
+            &index,
+            &conn.peer,
+            &node.uuid,
+            &rec.src_server,
+            &rec.dst_server,
+            rec.dst_port,
+            Transport::Udp,
+        )
+        .is_err()
+        {
+            continue;
+        }
+
         let reader = tokio::spawn(crate::node::ingress::ingress_reader(
             Arc::clone(conn),
             rec.flow_id,
@@ -637,6 +679,20 @@ fn restore_udp(node: &Arc<Node>, conn: &Arc<PeerConn>, udp: CarriedUdp) {
     }
 
     for rec in udp.egress {
+        if admit(
+            &index,
+            &node.uuid,
+            &conn.peer,
+            &rec.src_server,
+            &rec.dst_server,
+            rec.dst_port,
+            Transport::Udp,
+        )
+        .is_err()
+        {
+            continue;
+        }
+
         let Some(replies) = node.frontend_replies(rec.frontend_id) else {
             continue;
         };

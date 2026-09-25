@@ -12,6 +12,7 @@ use crate::{
                 REAUTH_INTERVAL, REAUTH_RECOVERY_GRACE, REAUTH_RETRY, control_writer,
                 negotiated_alpn, parity_for, peer_cert_hash, read_frame, write_frame,
             },
+            handshake::HandshakeBudget,
             registry::{Install, PeerRegistry, Role, close_loser},
         },
         relay::RelayRegistry,
@@ -113,6 +114,8 @@ pub struct Node {
 
     pub peers: PeerRegistry,
     pub relays: Arc<RelayRegistry>,
+    pub local_slots: Arc<tokio::sync::Semaphore>,
+    pub handshakes: Arc<HandshakeBudget>,
 
     pub docker: Option<DockerAdapter>,
     pub binder: Arc<dyn FrontendBinder>,
@@ -164,6 +167,8 @@ impl Node {
             provider,
             peers: PeerRegistry::new(uuid),
             relays: Arc::new(RelayRegistry::default()),
+            local_slots: Arc::new(tokio::sync::Semaphore::new(STREAM_SLOTS_PER_PEER)),
+            handshakes: Arc::new(HandshakeBudget::default()),
             docker,
             binder,
             hosts_template: config.hosts_path.clone(),
@@ -976,11 +981,23 @@ async fn enforce_auth_loop(node: Arc<Node>, conn: Arc<PeerConn>) {
 
 pub async fn accept_loop(node: Arc<Node>) {
     while let Some(incoming) = node.endpoint().accept().await {
+        let Some(slot) = node.handshakes.try_acquire(incoming.remote_address().ip()) else {
+            node.metrics.handshakes_refused.fetch_add(1, Relaxed);
+            tracing::debug!(
+                remote = %incoming.remote_address(),
+                "handshake budget exhausted, refusing an inbound connection"
+            );
+            incoming.refuse();
+            continue;
+        };
+
         tokio::spawn({
             let node = Arc::clone(&node);
 
             async move {
-                if let Err(err) = accept_one(&node, incoming).await {
+                let result = accept_one(&node, incoming).await;
+                drop(slot);
+                if let Err(err) = result {
                     tracing::debug!("rejected an inbound connection: {:?}", err);
                 }
             }
@@ -991,7 +1008,7 @@ pub async fn accept_loop(node: Arc<Node>) {
 
 async fn accept_one(node: &Arc<Node>, incoming: quinn::Incoming) -> Result<(), anyhow::Error> {
     let remote = incoming.remote_address();
-    let connection = match node.rtt_hint_by_ip(remote.ip()) {
+    let connecting = match node.rtt_hint_by_ip(remote.ip()) {
         Some(rtt) => {
             let config = quic::server_config(
                 &node.identity,
@@ -1002,11 +1019,15 @@ async fn accept_one(node: &Arc<Node>, incoming: quinn::Incoming) -> Result<(), a
             incoming
                 .accept_with(Arc::new(config))
                 .context("failed to start the inbound handshake")?
-                .await
         }
-        None => incoming.await,
-    }
-    .context("failed to complete the inbound handshake")?;
+        None => incoming
+            .accept()
+            .context("failed to start the inbound handshake")?,
+    };
+    let connection = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
+        .await
+        .context("failed to complete the inbound handshake before the timeout")?
+        .context("failed to complete the inbound handshake")?;
     check_alpn(&connection)?;
 
     let cert = peer_cert_hash(&connection).context("peer presented no certificate")?;
