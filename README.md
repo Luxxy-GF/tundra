@@ -17,3 +17,9 @@ carry every open connection across, so a node upgrade drops nothing.
 ## Star History
 
 ![Star History Chart](https://api.star-history.com/chart?repos=calagopus/tundra&type=date&legend=top-left&sealed_token=B2O-QGHUHAa_2R6TXAtmVmA-ASHkIyhBD3Rm6jlD9mOeO9XJsHW0uBvsZ-5zINucUHJPH5c29w8c7lL_2Kr7tb5770-KK58lG2pGrET0ksegRMrP1IEbft05EdOtyO6RAUCo1FCK5gnNscF6lwXhRp5LLQd08n2sZgUisdnct1irxGRvQmzUx9o-Bk4o)
+
+## Incus runtime
+
+The node can discover local Incus game containers instead of Docker. Set `WINGS_INCUS_SOCKET`, `WINGS_INCUS_PROJECT`, and `WINGS_INCUS_OWNER` to select Incus discovery. It admits only owned `wgs-UUID` containers, inspects their host PID and private address, and polls for starts, stops, and PID changes. Private TCP/UDP listeners, QUIC transport, and ACL enforcement stay shared with the Docker runtime.
+
+The `tundra-node` library exports `run()` for Wings to supervise an embedded node process. The standalone executable uses the same entry point.

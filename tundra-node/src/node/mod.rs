@@ -2,7 +2,7 @@ use crate::{
     config::NodeConfig,
     metrics::{Metrics, PeerMetrics},
     node::{
-        docker::{ContainerInfo, DockerAdapter},
+        docker::ContainerInfo,
         frontend::binder::{ContainerTarget, FrontendBinder},
         identity::Identity,
         plan::{FrontendKey, desired_hosts, needed_peers},
@@ -17,6 +17,7 @@ use crate::{
         },
         relay::RelayRegistry,
         restart::{Handover, Killed, frozen::FrozenStore, gate::AcceptGate, resume::PeerResume},
+        runtime::RuntimeAdapter,
         token::TokenStore,
     },
     pinning::CertPins,
@@ -49,12 +50,14 @@ use tundra_common::{
 pub mod docker;
 pub mod frontend;
 pub mod identity;
+pub(crate) mod incus;
 pub mod ingress;
 pub mod naming;
 pub mod plan;
 pub mod quic;
 pub mod relay;
 pub mod restart;
+pub mod runtime;
 pub mod token;
 
 pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(10);
@@ -117,7 +120,7 @@ pub struct Node {
     pub local_slots: Arc<tokio::sync::Semaphore>,
     pub handshakes: Arc<HandshakeBudget>,
 
-    pub docker: Option<DockerAdapter>,
+    pub runtime: Option<RuntimeAdapter>,
     pub binder: Arc<dyn FrontendBinder>,
     hosts_template: String,
     pub frontends: parking_lot::Mutex<HashMap<FrontendKey, FrontendHandle>>,
@@ -149,7 +152,7 @@ impl Node {
         remote: Arc<RemoteClient>,
         metrics: Arc<Metrics>,
         provider: Arc<CryptoProvider>,
-        docker: Option<DockerAdapter>,
+        runtime: Option<RuntimeAdapter>,
         binder: Arc<dyn FrontendBinder>,
         restart: Arc<Handover>,
         refresh_tx: mpsc::Sender<()>,
@@ -169,7 +172,7 @@ impl Node {
             relays: Arc::new(RelayRegistry::default()),
             local_slots: Arc::new(tokio::sync::Semaphore::new(STREAM_SLOTS_PER_PEER)),
             handshakes: Arc::new(HandshakeBudget::default()),
-            docker,
+            runtime,
             binder,
             hosts_template: config.hosts_path.clone(),
             frontends: parking_lot::Mutex::new(HashMap::new()),
@@ -387,7 +390,7 @@ impl Node {
     }
 
     pub async fn refresh_containers(&self, index: &SnapshotIndex) {
-        let Some(docker) = &self.docker else {
+        let Some(runtime) = &self.runtime else {
             return;
         };
 
@@ -397,7 +400,7 @@ impl Node {
                 continue;
             };
 
-            match docker.inspect(&entry.container_ref).await {
+            match runtime.inspect(&entry.container_ref).await {
                 Ok(info) if info.running => {
                     found.insert(*server, info);
                 }

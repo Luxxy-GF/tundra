@@ -19,7 +19,7 @@ bollard = { workspace = true }
 nix = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
 tokio-tungstenite = { workspace = true }
-reqwest = { workspace = true, features = ["rustls-no-provider"] }
+reqwest = { workspace = true, features = ["rustls-no-provider", "query", "json"] }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
